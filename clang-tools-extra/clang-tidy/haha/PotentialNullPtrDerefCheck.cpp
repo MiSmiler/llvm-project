@@ -24,7 +24,12 @@
 namespace clang::tidy::haha {
 
 using namespace ast_matchers;
+using dataflow::BoolValue;
+using dataflow::Environment;
+using dataflow::PointerValue;
+using dataflow::StorageLocation;
 using dataflow::TransferStateForDiagnostics;
+using dataflow::Value;
 
 namespace {
 
@@ -82,7 +87,7 @@ bool returnsNonNull(const FunctionDecl *FD) {
 
   // Check return type annotation
   QualType RetTy = FD->getReturnType();
-  if (RetTy->hasAttr(attr::Nonnull))
+  if (RetTy->hasAttr(attr::NonNull))
     return true;
 
   // Known functions that return non-null
@@ -149,7 +154,9 @@ bool isKnownNullExpr(const Expr *E) {
 using LatticeTransferState = dataflow::TransferState<dataflow::NoopLattice>;
 
 // Transfer function for pointer initialization
-void transferDeclStmt(const DeclStmt *DS, LatticeTransferState &State) {
+void transferDeclStmt(const DeclStmt *DS,
+                      const MatchFinder::MatchResult &,
+                      LatticeTransferState &State) {
   Environment &Env = State.Env;
 
   for (const Decl *D : DS->decls()) {
@@ -170,28 +177,32 @@ void transferDeclStmt(const DeclStmt *DS, LatticeTransferState &State) {
 
         if (Ty->isPointerType()) {
           // Raw pointer
-          Value *PtrVal = Env.getValue(*Init);
+          // Check if we already have a PointerValue - don't create new one
+          Value *ExistingVal = Env.getValue(*Loc);
+          PointerValue *PtrVal = nullptr;
+
+          if (ExistingVal) {
+            PtrVal = dyn_cast<PointerValue>(ExistingVal);
+          }
+
           if (!PtrVal) {
-            PtrVal = &Env.create<PointerValue>(*Loc);
+            // Create new PointerValue only if none exists
+            StorageLocation &PointeeLoc = Env.createStorageLocation(Ty->getPointeeType());
+            PtrVal = &Env.create<PointerValue>(PointeeLoc);
             Env.setValue(*Loc, *PtrVal);
           }
 
-          BoolValue *Nullness = getOrCreateNullness(*cast<PointerValue>(PtrVal), Env);
+          BoolValue *Nullness = getOrCreateNullness(*PtrVal, Env);
 
           // Set nullness based on initialization
           if (isKnownNullExpr(Init)) {
-            // Definitely null
-            Env.setValue(*Loc, *PtrVal);
-            Env.assume(Env.arena().makeAtomRef(Nullness->getAtom()));
+            // Definitely null - assume nullness is true
+            Env.assume(Nullness->formula());
           } else if (exprProducesNonNull(Init)) {
-            // Definitely non-null
-            Env.setValue(*Loc, *PtrVal);
+            // Definitely non-null - assume nullness is false
             Env.assume(Env.arena().makeNot(Nullness->formula()));
-          } else {
-            // Unknown - could be null
-            Env.setValue(*Loc, *PtrVal);
-            // Leave as atomic bool (unknown)
           }
+          // Unknown initialization - leave nullness unconstrained (could be null or non-null)
         } else if (isSmartPointer(Ty)) {
           // Smart pointer - track its internal pointer nullness
           if (auto *RecordLoc = cast_or_null<dataflow::RecordStorageLocation>(Loc)) {
@@ -211,7 +222,9 @@ void transferDeclStmt(const DeclStmt *DS, LatticeTransferState &State) {
 }
 
 // Transfer function for binary operators (assignment and comparison)
-void transferBinaryOperator(const BinaryOperator *BO, LatticeTransferState &State) {
+void transferBinaryOperator(const BinaryOperator *BO,
+                            const MatchFinder::MatchResult &,
+                            LatticeTransferState &State) {
   Environment &Env = State.Env;
 
   if (BO->isAssignmentOp()) {
@@ -241,106 +254,216 @@ void transferBinaryOperator(const BinaryOperator *BO, LatticeTransferState &Stat
   }
 }
 
-// Transfer function for pointer comparisons in conditions
-void transferBranchCondition(const Expr *Cond, bool Branch, Environment &Env) {
-  auto &A = Env.arena();
 
-  // Handle comparisons like: p != nullptr, p == nullptr, if (p), if (!p)
-  Cond = Cond->IgnoreParenImpCasts();
+// Transfer function for function calls - reset pointer nullness when passed by reference
+void transferCallExpr(const CallExpr *CE, const MatchFinder::MatchResult &,
+                      LatticeTransferState &State) {
+  Environment &Env = State.Env;
 
-  if (const auto *BO = dyn_cast<BinaryOperator>(Cond)) {
-    if (BO->isEqualityOp() || BO->isRelationalOp()) {
-      const Expr *LHS = BO->getLHS()->IgnoreParenImpCasts();
-      const Expr *RHS = BO->getRHS()->IgnoreParenImpCasts();
+  // Check if any argument is a pointer passed by reference (pointer to pointer)
+  // In such cases, we cannot know if the function modifies the pointer
+  for (unsigned I = 0; I < CE->getNumArgs(); ++I) {
+    const Expr *Arg = CE->getArg(I)->IgnoreParenImpCasts();
 
-      // Check if one side is a pointer and the other is null
-      bool LHSIsPtr = LHS->getType()->isPointerType();
-      bool RHSIsPtr = RHS->getType()->isPointerType();
-      bool LHSIsNull = isKnownNullExpr(LHS);
-      bool RHSIsNull = isKnownNullExpr(RHS);
-
-      if (LHSIsPtr && RHSIsNull) {
-        StorageLocation *Loc = Env.getStorageLocation(*LHS);
-        if (!Loc)
-          return;
-        Value *PtrVal = Env.getValue(*Loc);
-        if (!PtrVal)
-          return;
-        BoolValue *Nullness = getOrCreateNullness(*cast<PointerValue>(PtrVal), Env);
-
-        // p == nullptr: if Branch is true, p is null; if false, p is non-null
-        // p != nullptr: if Branch is true, p is non-null; if false, p is null
-        bool IsEq = BO->getOpcode() == BO_EQ;
-        bool ShouldBeNull = IsEq ? Branch : !Branch;
-
-        if (ShouldBeNull) {
-          Env.assume(Nullness->formula());
-        } else {
-          Env.assume(A.makeNot(Nullness->formula()));
-        }
-      } else if (RHSIsPtr && LHSIsNull) {
-        StorageLocation *Loc = Env.getStorageLocation(*RHS);
-        if (!Loc)
-          return;
-        Value *PtrVal = Env.getValue(*Loc);
-        if (!PtrVal)
-          return;
-        BoolValue *Nullness = getOrCreateNullness(*cast<PointerValue>(PtrVal), Env);
-
-        bool IsEq = BO->getOpcode() == BO_EQ;
-        bool ShouldBeNull = IsEq ? Branch : !Branch;
-
-        if (ShouldBeNull) {
-          Env.assume(Nullness->formula());
-        } else {
-          Env.assume(A.makeNot(Nullness->formula()));
+    // Check if argument is a pointer to pointer (e.g., Info**)
+    if (Arg->getType()->isPointerType()) {
+      QualType PointeeType = Arg->getType()->getPointeeType();
+      if (PointeeType->isPointerType()) {
+        // This is a pointer-to-pointer argument (e.g., &pInfo)
+        // If the inner pointer is a DeclRefExpr, we need to reset its nullness
+        if (const auto *UO = dyn_cast<UnaryOperator>(Arg)) {
+          if (UO->getOpcode() == UO_AddrOf) {
+            const Expr *SubExpr = UO->getSubExpr()->IgnoreParenImpCasts();
+            if (const auto *DRE = dyn_cast<DeclRefExpr>(SubExpr)) {
+              if (const auto *VD = dyn_cast<VarDecl>(DRE->getDecl())) {
+                if (VD->getType()->isPointerType()) {
+                  // Reset the nullness of the pointer variable to unknown
+                  StorageLocation *Loc = Env.getStorageLocation(*VD);
+                  if (Loc) {
+                    Value *Val = Env.getValue(*Loc);
+                    if (auto *PtrVal = dyn_cast_or_null<PointerValue>(Val)) {
+                      // Create a fresh unknown nullness
+                      BoolValue &NewNullness = Env.makeAtomicBoolValue();
+                      PtrVal->setProperty(IsNullProp, NewNullness);
+                      // Don't assume anything about it - it's now unknown
+                    }
+                  }
+                }
+              }
+            }
+          }
         }
       }
     }
-  } else if (const auto *UO = dyn_cast<UnaryOperator>(Cond)) {
-    if (UO->getOpcode() == UO_LNot) {
-      // !p: if Branch is true, p is null; if false, p is non-null
-      const Expr *SubExpr = UO->getSubExpr()->IgnoreParenImpCasts();
-      if (SubExpr->getType()->isPointerType()) {
-        StorageLocation *Loc = Env.getStorageLocation(*SubExpr);
-        if (!Loc)
-          return;
-        Value *PtrVal = Env.getValue(*Loc);
-        if (!PtrVal)
-          return;
-        BoolValue *Nullness = getOrCreateNullness(*cast<PointerValue>(PtrVal), Env);
+  }
+}
 
-        if (Branch) {
-          Env.assume(Nullness->formula());
-        } else {
-          Env.assume(A.makeNot(Nullness->formula()));
-        }
-      }
+// Helper function to get pointer nullness from an expression
+// Returns the nullness BoolValue if the expression is a pointer, nullptr otherwise
+BoolValue *getPointerNullnessFromExpr(const Expr *E, Environment &Env) {
+  E = E->IgnoreParenImpCasts();
+
+  if (!E->getType()->isPointerType())
+    return nullptr;
+
+  // For DeclRefExpr, get the value directly from the variable's storage location
+  if (const auto *DRE = dyn_cast<DeclRefExpr>(E)) {
+    if (const auto *VD = dyn_cast<VarDecl>(DRE->getDecl())) {
+      StorageLocation *Loc = Env.getStorageLocation(*VD);
+      if (!Loc)
+        return nullptr;
+      Value *Val = Env.getValue(*Loc);
+      if (!Val)
+        return nullptr;
+      if (auto *PtrVal = dyn_cast<PointerValue>(Val))
+        return getOrCreateNullness(*PtrVal, Env);
     }
-  } else if (Cond->getType()->isPointerType()) {
-    // if (p): p is used as a boolean - if true (Branch), p is non-null
-    StorageLocation *Loc = Env.getStorageLocation(*Cond);
+    return nullptr;
+  }
+
+  // Try to get PointerValue directly from expression
+  auto *PtrVal = Env.get<PointerValue>(*E);
+  if (PtrVal)
+    return getOrCreateNullness(*PtrVal, Env);
+
+  // Try to get from storage location
+  StorageLocation *Loc = Env.getStorageLocation(*E);
+  if (!Loc)
+    return nullptr;
+  Value *Val = Env.getValue(*Loc);
+  if (!Val)
+    return nullptr;
+  PtrVal = dyn_cast<PointerValue>(Val);
+  if (!PtrVal)
+    return nullptr;
+
+  return getOrCreateNullness(*PtrVal, Env);
+}
+
+// Transfer function for pointer-to-bool conversion
+// This is crucial for making branch conditions work correctly
+// When a pointer is used in a boolean context (if (p), while (p), etc.),
+// we need to connect the BoolValue to the pointer's nullness property
+void transferPointerToBoolean(const ImplicitCastExpr *ICE,
+                              const MatchFinder::MatchResult &,
+                              LatticeTransferState &State) {
+  Environment &Env = State.Env;
+
+  const Expr *SubExpr = ICE->getSubExpr();
+  if (!SubExpr)
+    return;
+
+  // Get the pointer value from the subexpression
+  // The subexpression should be a PointerValue (from LValueToRValue cast or similar)
+  auto *PtrVal = Env.get<PointerValue>(*SubExpr);
+  if (!PtrVal) {
+    // Try to get from storage location
+    StorageLocation *Loc = Env.getStorageLocation(*SubExpr);
     if (!Loc)
       return;
-    Value *PtrVal = Env.getValue(*Loc);
+    Value *Val = Env.getValue(*Loc);
+    if (!Val)
+      return;
+    PtrVal = dyn_cast<PointerValue>(Val);
     if (!PtrVal)
       return;
-    BoolValue *Nullness = getOrCreateNullness(*cast<PointerValue>(PtrVal), Env);
+  }
 
-    // if (p) means p != nullptr
-    if (Branch) {
-      Env.assume(A.makeNot(Nullness->formula()));
-    } else {
-      Env.assume(Nullness->formula());
+  // Get or create the nullness property for this pointer
+  BoolValue *Nullness = getOrCreateNullness(*PtrVal, Env);
+
+  // Set the nullness BoolValue as the value of this cast expression
+  // This connects pointer nullness to the framework's branch condition handling
+  Env.setValue(*ICE, *Nullness);
+}
+
+// Transfer function for pointer equality comparisons with null
+// Handles p == nullptr and p != nullptr
+void transferPointerNullComparison(const BinaryOperator *BO,
+                                   const MatchFinder::MatchResult &,
+                                   LatticeTransferState &State) {
+  Environment &Env = State.Env;
+
+  if (!BO->isEqualityOp())
+    return;
+
+  const Expr *LHS = BO->getLHS()->IgnoreParenImpCasts();
+  const Expr *RHS = BO->getRHS()->IgnoreParenImpCasts();
+
+  // Check if one side is a pointer and the other is null
+  bool LHSIsPtr = LHS->getType()->isPointerType();
+  bool RHSIsPtr = RHS->getType()->isPointerType();
+  bool LHSIsNull = isKnownNullExpr(LHS);
+  bool RHSIsNull = isKnownNullExpr(RHS);
+
+  BoolValue *Nullness = nullptr;
+
+  if (LHSIsPtr && RHSIsNull) {
+    // p == nullptr or p != nullptr
+    auto *PtrVal = Env.get<PointerValue>(*LHS);
+    if (!PtrVal) {
+      StorageLocation *Loc = Env.getStorageLocation(*LHS);
+      if (Loc) {
+        Value *Val = Env.getValue(*Loc);
+        PtrVal = dyn_cast_or_null<PointerValue>(Val);
+      }
     }
+    if (PtrVal)
+      Nullness = getOrCreateNullness(*PtrVal, Env);
+  } else if (RHSIsPtr && LHSIsNull) {
+    // nullptr == p or nullptr != p
+    auto *PtrVal = Env.get<PointerValue>(*RHS);
+    if (!PtrVal) {
+      StorageLocation *Loc = Env.getStorageLocation(*RHS);
+      if (Loc) {
+        Value *Val = Env.getValue(*Loc);
+        PtrVal = dyn_cast_or_null<PointerValue>(Val);
+      }
+    }
+    if (PtrVal)
+      Nullness = getOrCreateNullness(*PtrVal, Env);
+  }
+
+  if (!Nullness)
+    return;
+
+  // p == nullptr: result is Nullness (true if null)
+  // p != nullptr: result is !Nullness (true if not null)
+  if (BO->getOpcode() == BO_EQ) {
+    Env.setValue(*BO, *Nullness);
+  } else { // BO_NE
+    Env.setValue(*BO, Env.makeNot(*Nullness));
   }
 }
 
 // Build the transfer match switch
 auto buildTransferMatchSwitch() {
+  using namespace ast_matchers;
+
+  // Matcher for pointer-to-boolean conversion (used in conditions like if (p))
+  auto PointerToBoolMatcher = implicitCastExpr(hasCastKind(CK_PointerToBoolean));
+
+  // Matcher for pointer-null equality comparison (p == nullptr, p != nullptr)
+  // We need to match: pointer == null, null == pointer, pointer != null, null != pointer
+  auto PointerNullEqMatcher = binaryOperator(
+      hasAnyOperatorName("==", "!="),
+      anyOf(
+          // pointer == nullptr or pointer != nullptr
+          allOf(hasLHS(hasType(pointerType())),
+                hasRHS(ignoringParenImpCasts(nullPointerConstant()))),
+          // nullptr == pointer or nullptr != pointer
+          allOf(hasLHS(ignoringParenImpCasts(nullPointerConstant())),
+                hasRHS(hasType(pointerType())))
+      ));
+
   return dataflow::CFGMatchSwitchBuilder<LatticeTransferState>()
       .CaseOfCFGStmt<DeclStmt>(declStmt(), transferDeclStmt)
       .CaseOfCFGStmt<BinaryOperator>(binaryOperator(), transferBinaryOperator)
+      .CaseOfCFGStmt<CallExpr>(callExpr(), transferCallExpr)
+      // Handle pointer-to-boolean conversion - this is key for branch conditions
+      .CaseOfCFGStmt<ImplicitCastExpr>(PointerToBoolMatcher, transferPointerToBoolean)
+      // Handle pointer-null equality comparisons
+      .CaseOfCFGStmt<BinaryOperator>(PointerNullEqMatcher, transferPointerNullComparison)
       .Build();
 }
 
@@ -349,15 +472,17 @@ class PotentialNullPtrDerefModel
     : public dataflow::DataflowAnalysis<PotentialNullPtrDerefModel, dataflow::NoopLattice> {
 public:
   PotentialNullPtrDerefModel(ASTContext &Ctx, Environment &Env)
-      : DataflowAnalysis(Ctx, Env),
+      : DataflowAnalysis(Ctx),
         TransferMatchSwitch(buildTransferMatchSwitch()) {
     // Set up synthetic field callback for smart pointers
     Env.getDataflowAnalysisContext().setSyntheticFieldCallback(
         [&Ctx](QualType Ty) -> llvm::StringMap<QualType> {
           if (isSmartPointer(Ty)) {
-            return {"has_value", Ctx.BoolTy};
+            llvm::StringMap<QualType> Fields;
+            Fields["has_value"] = Ctx.BoolTy;
+            return Fields;
           }
-          return {};
+          return llvm::StringMap<QualType>();
         });
   }
 
@@ -368,18 +493,89 @@ public:
     TransferMatchSwitch(Elt, getASTContext(), State);
   }
 
-  void transferBranch(bool Branch, const Stmt *Stmt, dataflow::NoopLattice &L,
+  // Handle branch conditions for pointer nullness tracking
+  // This is called by the framework when evaluating branch conditions
+  // We directly assume pointer nullness based on the branch direction
+  // IMPORTANT: Stmt is the condition expression, not the terminator statement!
+  void transferBranch(bool Branch, const Stmt *S, dataflow::NoopLattice &,
                       Environment &Env) {
-    // Handle branch conditions for null pointer tracking
-    if (const auto *If = dyn_cast<IfStmt>(Stmt)) {
-      transferBranchCondition(If->getCond(), Branch, Env);
-    } else if (const auto *While = dyn_cast<WhileStmt>(Stmt)) {
-      transferBranchCondition(While->getCond(), Branch, Env);
-    } else if (const auto *For = dyn_cast<ForStmt>(Stmt)) {
-      if (For->getCond())
-        transferBranchCondition(For->getCond(), Branch, Env);
-    } else if (const auto *CondOp = dyn_cast<ConditionalOperator>(Stmt)) {
-      transferBranchCondition(CondOp->getCond(), Branch, Env);
+    // S is already the condition expression (e.g., !pInfo, pInfo == nullptr, etc.)
+    const Expr *Cond = dyn_cast<Expr>(S);
+    if (!Cond)
+      return;
+
+    Cond = Cond->IgnoreParenImpCasts();
+    auto &A = Env.arena();
+
+    // Case 1: Pointer used directly as boolean (if (p))
+    // p is true iff p != nullptr (i.e., p is not null)
+    if (const auto *ICE = dyn_cast<ImplicitCastExpr>(Cond)) {
+      if (ICE->getCastKind() == CK_PointerToBoolean) {
+        BoolValue *Nullness = getPointerNullnessFromExpr(ICE->getSubExpr(), Env);
+        if (Nullness) {
+          // if (p) with Branch=true: p is non-null, assume !Nullness
+          // if (p) with Branch=false: p is null, assume Nullness
+          if (Branch) {
+            Env.assume(A.makeNot(Nullness->formula()));
+          } else {
+            Env.assume(Nullness->formula());
+          }
+        }
+      }
+    }
+
+    // Case 2: Pointer negation (if (!p))
+    // !p is true iff p is null
+    if (const auto *UO = dyn_cast<UnaryOperator>(Cond)) {
+      if (UO->getOpcode() == UO_LNot) {
+        const Expr *SubExpr = UO->getSubExpr()->IgnoreParenImpCasts();
+        BoolValue *Nullness = getPointerNullnessFromExpr(SubExpr, Env);
+        if (Nullness) {
+          // if (!p) with Branch=true: p is null, assume Nullness
+          // if (!p) with Branch=false: p is non-null, assume !Nullness
+          if (Branch) {
+            Env.assume(Nullness->formula());
+          } else {
+            Env.assume(A.makeNot(Nullness->formula()));
+          }
+        }
+      }
+    }
+
+    // Case 3: Pointer compared to null (if (p == nullptr), if (p != nullptr))
+    if (const auto *BO = dyn_cast<BinaryOperator>(Cond)) {
+      if (BO->isEqualityOp()) {
+        const Expr *LHS = BO->getLHS()->IgnoreParenImpCasts();
+        const Expr *RHS = BO->getRHS()->IgnoreParenImpCasts();
+
+        BoolValue *Nullness = nullptr;
+
+        if (LHS->getType()->isPointerType() && isKnownNullExpr(RHS)) {
+          Nullness = getPointerNullnessFromExpr(LHS, Env);
+        } else if (RHS->getType()->isPointerType() && isKnownNullExpr(LHS)) {
+          Nullness = getPointerNullnessFromExpr(RHS, Env);
+        }
+
+        if (Nullness) {
+          // p == nullptr with Branch=true: p is null, assume Nullness
+          // p == nullptr with Branch=false: p is non-null, assume !Nullness
+          // p != nullptr with Branch=true: p is non-null, assume !Nullness
+          // p != nullptr with Branch=false: p is null, assume Nullness
+          if (BO->getOpcode() == BO_EQ) {
+            if (Branch) {
+              Env.assume(Nullness->formula());
+            } else {
+              Env.assume(A.makeNot(Nullness->formula()));
+            }
+          } else { // BO_NE
+            if (Branch) {
+              Env.assume(A.makeNot(Nullness->formula()));
+            } else {
+              Env.assume(Nullness->formula());
+            }
+          }
+        }
+      }
     }
   }
 
@@ -401,38 +597,38 @@ private:
   llvm::SmallVector<SourceLocation> checkDereference(const Expr *PtrExpr,
                                                      const Environment &Env) {
     if (!PtrExpr)
-      return {};
+      return llvm::SmallVector<SourceLocation>();
 
     PtrExpr = PtrExpr->IgnoreParenImpCasts();
 
     // Get the pointer value
     StorageLocation *Loc = Env.getStorageLocation(*PtrExpr);
     if (!Loc)
-      return {PtrExpr->getExprLoc()}; // Unknown pointer - could be null
+      return llvm::SmallVector<SourceLocation>({PtrExpr->getExprLoc()}); // Unknown pointer - could be null
 
     Value *Val = Env.getValue(*Loc);
     if (!Val)
-      return {PtrExpr->getExprLoc()};
+      return llvm::SmallVector<SourceLocation>({PtrExpr->getExprLoc()});
 
     if (auto *PtrVal = dyn_cast<PointerValue>(Val)) {
       BoolValue *Nullness = getNullness(*PtrVal);
       if (!Nullness) {
         // No nullness tracked - assume could be null
-        return {PtrExpr->getExprLoc()};
+        return llvm::SmallVector<SourceLocation>({PtrExpr->getExprLoc()});
       }
 
       // Check if we can prove the pointer is non-null
       auto &A = Env.arena();
       if (Env.proves(A.makeNot(Nullness->formula()))) {
         // Proven non-null - safe
-        return {};
+        return llvm::SmallVector<SourceLocation>();
       }
 
       // Cannot prove non-null - potential null dereference
-      return {PtrExpr->getExprLoc()};
+      return llvm::SmallVector<SourceLocation>({PtrExpr->getExprLoc()});
     }
 
-    return {};
+    return llvm::SmallVector<SourceLocation>();
   }
 
   dataflow::CFGMatchSwitch<const Environment, llvm::SmallVector<SourceLocation>>
@@ -466,14 +662,14 @@ private:
                   Value *HasVal = Env.getValue(RecordLoc->getSyntheticField("has_value"));
                   if (auto *BoolVal = dyn_cast_or_null<BoolValue>(HasVal)) {
                     if (Env.proves(Env.arena().makeNot(BoolVal->formula())))
-                      return {};
+                      return llvm::SmallVector<SourceLocation>();
                   }
                 }
-                return {Arg->getExprLoc()};
+                return llvm::SmallVector<SourceLocation>({Arg->getExprLoc()});
               }
               return checkDereference(Arg, Env);
             }
-            return {};
+            return llvm::SmallVector<SourceLocation>();
           })
       // Detect smart pointer operator*
       .CaseOfCFGStmt<CXXOperatorCallExpr>(
@@ -488,14 +684,14 @@ private:
                   Value *HasVal = Env.getValue(RecordLoc->getSyntheticField("has_value"));
                   if (auto *BoolVal = dyn_cast_or_null<BoolValue>(HasVal)) {
                     if (Env.proves(Env.arena().makeNot(BoolVal->formula())))
-                      return {};
+                      return llvm::SmallVector<SourceLocation>();
                   }
                 }
-                return {Arg->getExprLoc()};
+                return llvm::SmallVector<SourceLocation>({Arg->getExprLoc()});
               }
               return checkDereference(Arg, Env);
             }
-            return {};
+            return llvm::SmallVector<SourceLocation>();
           })
       .Build();
 };
@@ -504,13 +700,14 @@ private:
 
 void PotentialNullPtrDerefCheck::registerMatchers(MatchFinder *Finder) {
   // Match functions that may contain pointer dereferences
+  auto HasPtrDerefDescendant = hasDescendant(
+      stmt(anyOf(memberExpr(isArrow()),
+                 unaryOperator(hasOperatorName("*")),
+                 cxxOperatorCallExpr(hasAnyOverloadedOperatorName("->", "*")))));
+
   Finder->addMatcher(
       functionDecl(unless(isExpansionInSystemHeader()),
-                   hasBody(stmt(hasDescendant(
-                       anyOf(memberExpr(isArrow()),
-                             unaryOperator(hasOperatorName("*")),
-                             cxxOperatorCallExpr(hasAnyOverloadedOperatorName("->", "*"))))))
-                   )
+                   hasBody(HasPtrDerefDescendant))
           .bind(FuncID),
       this);
 }

@@ -44,12 +44,14 @@ ninja clang-tidy
 
 ### Running Unit Tests
 
-```bash
-# Run haha module tests
-ninja check-clang-tidy-haha
+NOTE: Run these commands from the build directory (`cd build` first)
 
-# Or run tests for a specific check
-llvm-lit -v clang-tools-extra/test/clang-tidy/checkers/haha/
+```bash
+# Run haha module tests using llvm-lit
+bin/llvm-lit -v ../clang-tools-extra/test/clang-tidy/checkers/haha/
+
+# Or run all clang-tools tests (includes haha)
+ninja check-clang-tools
 ```
 
 ### Manual Testing
