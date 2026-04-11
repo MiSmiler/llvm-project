@@ -203,6 +203,11 @@ New checks
   to reading out-of-bounds data due to inadequate or incorrect string null
   termination.
 
+- New :doc:`haha-potential-null-ptr-deref
+  <clang-tidy/checks/haha/potential-null-ptr-deref>` check.
+
+  FIXME: add release notes.
+
 - New :doc:`misc-use-internal-linkage
   <clang-tidy/checks/misc/use-internal-linkage>` check.
 
