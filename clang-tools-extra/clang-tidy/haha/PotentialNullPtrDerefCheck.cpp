@@ -79,16 +79,6 @@ bool isSmartPointer(const QualType &Ty) {
   return RD->getDeclContext()->isStdNamespace();
 }
 
-// Check if a CXXRecordDecl is a known smart pointer type
-bool isSmartPointerClass(const CXXRecordDecl *RD) {
-  if (!RD || !RD->getIdentifier())
-    return false;
-  StringRef Name = RD->getName();
-  if (Name != "unique_ptr" && Name != "shared_ptr" && Name != "weak_ptr")
-    return false;
-  return RD->getDeclContext()->isStdNamespace();
-}
-
 // Check if a function is known to return a non-null pointer
 bool returnsNonNull(const FunctionDecl *FD) {
   if (!FD)
@@ -574,11 +564,14 @@ public:
     if (!Cond)
       return;
 
-    Cond = Cond->IgnoreParenImpCasts();
     auto &A = Env.arena();
+
+    // IMPORTANT: We need to check the ORIGINAL condition expression (before IgnoreParenImpCasts)
+    // to properly handle different AST patterns.
 
     // Case 1: Pointer used directly as boolean (if (p))
     // p is true iff p != nullptr (i.e., p is not null)
+    // For raw pointers: condition is ImplicitCastExpr(PointerToBoolean)
     if (const auto *ICE = dyn_cast<ImplicitCastExpr>(Cond)) {
       if (ICE->getCastKind() == CK_PointerToBoolean) {
         BoolValue *Nullness = getPointerNullnessFromExpr(ICE->getSubExpr(), Env);
@@ -592,13 +585,82 @@ public:
           }
         }
       }
+      // For smart pointers: ImplicitCastExpr wrapping CXXMemberCallExpr(operator bool)
+      // We need to handle this case too
+      if (ICE->getCastKind() == CK_UserDefinedConversion ||
+          ICE->getCastKind() == CK_IntegralToBoolean) {
+        const Expr *SubExpr = ICE->getSubExpr()->IgnoreParenImpCasts();
+        if (const auto *MCE = dyn_cast<CXXMemberCallExpr>(SubExpr)) {
+          if (const CXXMethodDecl *MD = MCE->getMethodDecl()) {
+            if (MD->getNameAsString() == "operator bool") {
+              const CXXRecordDecl *Class = MD->getParent();
+              if (Class && Class->getIdentifier() &&
+                  (Class->getName() == "unique_ptr" || Class->getName() == "shared_ptr" ||
+                   Class->getName() == "weak_ptr")) {
+                const Expr *ObjectArg = MCE->getImplicitObjectArgument();
+                if (ObjectArg) {
+                  ObjectArg = ObjectArg->IgnoreParenImpCasts();
+                  StorageLocation *Loc = Env.getStorageLocation(*ObjectArg);
+                  if (auto *RecordLoc = dyn_cast_or_null<dataflow::RecordStorageLocation>(Loc)) {
+                    Value *HasVal = Env.getValue(RecordLoc->getSyntheticField("has_value"));
+                    if (auto *BoolVal = dyn_cast_or_null<BoolValue>(HasVal)) {
+                      if (Branch) {
+                        Env.assume(BoolVal->formula());
+                      } else {
+                        Env.assume(A.makeNot(BoolVal->formula()));
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
     }
 
     // Case 2: Pointer negation (if (!p))
     // !p is true iff p is null
     if (const auto *UO = dyn_cast<UnaryOperator>(Cond)) {
       if (UO->getOpcode() == UO_LNot) {
-        const Expr *SubExpr = UO->getSubExpr()->IgnoreParenImpCasts();
+        const Expr *SubExpr = UO->getSubExpr();
+        // For smart pointers, SubExpr might be ImplicitCastExpr wrapping operator bool call
+        if (const auto *SubICE = dyn_cast<ImplicitCastExpr>(SubExpr)) {
+          if (SubICE->getCastKind() == CK_UserDefinedConversion ||
+              SubICE->getCastKind() == CK_IntegralToBoolean) {
+            const Expr *Inner = SubICE->getSubExpr()->IgnoreParenImpCasts();
+            if (const auto *MCE = dyn_cast<CXXMemberCallExpr>(Inner)) {
+              if (const CXXMethodDecl *MD = MCE->getMethodDecl()) {
+                if (MD->getNameAsString() == "operator bool") {
+                  const CXXRecordDecl *Class = MD->getParent();
+                  if (Class && Class->getIdentifier() &&
+                      (Class->getName() == "unique_ptr" || Class->getName() == "shared_ptr" ||
+                       Class->getName() == "weak_ptr")) {
+                    const Expr *ObjectArg = MCE->getImplicitObjectArgument();
+                    if (ObjectArg) {
+                      ObjectArg = ObjectArg->IgnoreParenImpCasts();
+                      StorageLocation *Loc = Env.getStorageLocation(*ObjectArg);
+                      if (auto *RecordLoc = dyn_cast_or_null<dataflow::RecordStorageLocation>(Loc)) {
+                        Value *HasVal = Env.getValue(RecordLoc->getSyntheticField("has_value"));
+                        if (auto *BoolVal = dyn_cast_or_null<BoolValue>(HasVal)) {
+                          // if (!sp) with Branch=true: sp is null, assume !has_value
+                          // if (!sp) with Branch=false: sp has value, assume has_value
+                          if (Branch) {
+                            Env.assume(A.makeNot(BoolVal->formula()));
+                          } else {
+                            Env.assume(BoolVal->formula());
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+        // For raw pointers
+        SubExpr = SubExpr->IgnoreParenImpCasts();
         BoolValue *Nullness = getPointerNullnessFromExpr(SubExpr, Env);
         if (Nullness) {
           // if (!p) with Branch=true: p is null, assume Nullness
@@ -642,34 +704,6 @@ public:
               Env.assume(A.makeNot(Nullness->formula()));
             } else {
               Env.assume(Nullness->formula());
-            }
-          }
-        }
-      }
-    }
-
-    // Case 4: Smart pointer operator bool (if (sp))
-    // sp.operator bool() returns true iff sp has_value (is non-null)
-    if (const auto *MCE = dyn_cast<CXXMemberCallExpr>(Cond)) {
-      if (const CXXMethodDecl *MD = MCE->getMethodDecl()) {
-        if (MD->getNameAsString() == "operator bool" &&
-            isSmartPointerClass(MD->getParent())) {
-          const Expr *ObjectArg = MCE->getImplicitObjectArgument();
-          if (!ObjectArg)
-            return;
-          ObjectArg = ObjectArg->IgnoreParenImpCasts();
-          StorageLocation *Loc = Env.getStorageLocation(*ObjectArg);
-          if (auto *RecordLoc = dyn_cast_or_null<dataflow::RecordStorageLocation>(Loc)) {
-            Value *HasVal = Env.getValue(RecordLoc->getSyntheticField("has_value"));
-            if (auto *BoolVal = dyn_cast_or_null<BoolValue>(HasVal)) {
-              // operator bool returns has_value (true if smart pointer holds value)
-              // if (sp) with Branch=true: sp has value, assume HasVal
-              // if (sp) with Branch=false: sp has no value, assume !HasVal
-              if (Branch) {
-                Env.assume(BoolVal->formula());
-              } else {
-                Env.assume(A.makeNot(BoolVal->formula()));
-              }
             }
           }
         }
@@ -728,6 +762,15 @@ public:
   }
 
 private:
+  // Check if current point is reachable (not dead code)
+  // If flow condition is contradictory, the point is unreachable
+  bool isReachable(const Environment &Env) {
+    // If the flow condition doesn't even allow "true" to be true,
+    // then it's contradictory and the point is unreachable
+    auto &A = Env.arena();
+    return Env.allows(A.makeLiteral(true));
+  }
+
   // Check if dereference of a pointer is safe
   llvm::SmallVector<SourceLocation> checkDereference(const Expr *PtrExpr,
                                                      const Environment &Env) {
@@ -735,6 +778,10 @@ private:
       return llvm::SmallVector<SourceLocation>();
 
     PtrExpr = PtrExpr->IgnoreParenImpCasts();
+
+    // Check if current point is reachable (dead code should not report warnings)
+    if (!isReachable(Env))
+      return llvm::SmallVector<SourceLocation>();
 
     // Get the pointer value
     StorageLocation *Loc = Env.getStorageLocation(*PtrExpr);
@@ -770,10 +817,18 @@ private:
       DiagnoseMatchSwitch = dataflow::CFGMatchSwitchBuilder<const Environment,
                                                             llvm::SmallVector<SourceLocation>>()
       // Detect -> operator (MemberExpr with arrow)
+      // But skip if the base is a smart pointer operator-> call - that's handled separately
       .CaseOfCFGStmt<MemberExpr>(
           memberExpr(isArrow()),
           [this](const MemberExpr *ME, const MatchFinder::MatchResult &,
                  const Environment &Env) {
+            const Expr *Base = ME->getBase()->IgnoreParenImpCasts();
+            // Skip if this is a smart pointer operator-> call result
+            // Smart pointer operator-> is handled by the CXXOperatorCallExpr handler below
+            if (const auto *CE = dyn_cast<CXXOperatorCallExpr>(Base)) {
+              if (CE->getOperator() == OO_Arrow)
+                return llvm::SmallVector<SourceLocation>();  // Handled by CXXOperatorCallExpr handler
+            }
             return checkDereference(ME->getBase(), Env);
           })
       // Detect * operator (UnaryOperator dereference)
@@ -788,6 +843,9 @@ private:
           cxxOperatorCallExpr(hasOverloadedOperatorName("->")),
           [this](const CXXOperatorCallExpr *CE, const MatchFinder::MatchResult &,
                  const Environment &Env) {
+            // Check if current point is reachable (dead code should not report warnings)
+            if (!isReachable(Env))
+              return llvm::SmallVector<SourceLocation>();
             if (CE->getNumArgs() > 0) {
               const Expr *Arg = CE->getArg(0);
               if (isSmartPointer(Arg->getType())) {
@@ -813,6 +871,9 @@ private:
           cxxOperatorCallExpr(hasOverloadedOperatorName("*")),
           [this](const CXXOperatorCallExpr *CE, const MatchFinder::MatchResult &,
                  const Environment &Env) {
+            // Check if current point is reachable (dead code should not report warnings)
+            if (!isReachable(Env))
+              return llvm::SmallVector<SourceLocation>();
             if (CE->getNumArgs() > 0) {
               const Expr *Arg = CE->getArg(0);
               if (isSmartPointer(Arg->getType())) {
