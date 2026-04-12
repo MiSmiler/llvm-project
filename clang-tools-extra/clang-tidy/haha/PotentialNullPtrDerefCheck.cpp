@@ -38,6 +38,19 @@ constexpr llvm::StringLiteral FuncID = "func";
 // Nullness property name stored on pointer values
 constexpr llvm::StringLiteral IsNullProp = "is_null";
 
+// AST matcher for smart pointer types
+AST_MATCHER(QualType, isSmartPointerType) {
+  if (!Node->isRecordType())
+    return false;
+  const CXXRecordDecl *RD = Node->getAsCXXRecordDecl();
+  if (!RD || !RD->getIdentifier())
+    return false;
+  StringRef Name = RD->getName();
+  if (Name != "unique_ptr" && Name != "shared_ptr" && Name != "weak_ptr")
+    return false;
+  return RD->getDeclContext()->isStdNamespace();
+}
+
 // Get or create the nullness property for a pointer value
 BoolValue *getOrCreateNullness(PointerValue &PtrVal, Environment &Env) {
   Value *Prop = PtrVal.getProperty(IsNullProp);
@@ -205,15 +218,18 @@ void transferDeclStmt(const DeclStmt *DS,
           // Unknown initialization - leave nullness unconstrained (could be null or non-null)
         } else if (isSmartPointer(Ty)) {
           // Smart pointer - track its internal pointer nullness
+          // has_value represents whether the smart pointer holds a value (non-null)
           if (auto *RecordLoc = cast_or_null<dataflow::RecordStorageLocation>(Loc)) {
-            BoolValue *Nullness = &Env.makeAtomicBoolValue();
+            BoolValue *HasValue = &Env.makeAtomicBoolValue();
             if (isKnownNullExpr(Init)) {
-              Env.assume(Nullness->formula());
+              // Initialized with nullptr - has_value is false
+              Env.assume(Env.arena().makeNot(HasValue->formula()));
             } else if (exprProducesNonNull(Init)) {
-              Env.assume(Env.arena().makeNot(Nullness->formula()));
+              // Initialized with non-null - has_value is true
+              Env.assume(HasValue->formula());
             }
-            // Store nullness as a synthetic field
-            Env.setValue(RecordLoc->getSyntheticField("has_value"), *Nullness);
+            // Store has_value as a synthetic field
+            Env.setValue(RecordLoc->getSyntheticField("has_value"), *HasValue);
           }
         }
       }
@@ -344,6 +360,8 @@ BoolValue *getPointerNullnessFromExpr(const Expr *E, Environment &Env) {
 // This is crucial for making branch conditions work correctly
 // When a pointer is used in a boolean context (if (p), while (p), etc.),
 // we need to connect the BoolValue to the pointer's nullness property
+// Key insight: if (p) is equivalent to if (p != nullptr), so the BoolValue
+// should be NOT nullness (true when pointer is non-null)
 void transferPointerToBoolean(const ImplicitCastExpr *ICE,
                               const MatchFinder::MatchResult &,
                               LatticeTransferState &State) {
@@ -372,9 +390,13 @@ void transferPointerToBoolean(const ImplicitCastExpr *ICE,
   // Get or create the nullness property for this pointer
   BoolValue *Nullness = getOrCreateNullness(*PtrVal, Env);
 
-  // Set the nullness BoolValue as the value of this cast expression
-  // This connects pointer nullness to the framework's branch condition handling
-  Env.setValue(*ICE, *Nullness);
+  // For pointer-to-boolean conversion:
+  // The result BoolValue should be NOT nullness
+  // (pointer is true/non-zero iff it is non-null)
+  // This way, the framework's assumption on the condition BoolValue
+  // directly affects the nullness BoolValue
+  BoolValue &ConditionBool = Env.makeNot(*Nullness);
+  Env.setValue(*ICE, ConditionBool);
 }
 
 // Transfer function for pointer equality comparisons with null
@@ -436,6 +458,45 @@ void transferPointerNullComparison(const BinaryOperator *BO,
   }
 }
 
+// Transfer function for smart pointer operator bool
+// This connects the smart pointer's has_value to the boolean result
+void transferSmartPointerBool(const CXXMemberCallExpr *MCE,
+                              const MatchFinder::MatchResult &,
+                              LatticeTransferState &State) {
+  Environment &Env = State.Env;
+
+  // Get the implicit object (the smart pointer)
+  const Expr *ObjectArg = MCE->getImplicitObjectArgument();
+  if (!ObjectArg)
+    return;
+
+  ObjectArg = ObjectArg->IgnoreParenImpCasts();
+  if (!isSmartPointer(ObjectArg->getType()))
+    return;
+
+  StorageLocation *Loc = Env.getStorageLocation(*ObjectArg);
+  if (!Loc)
+    return;
+
+  auto *RecordLoc = dyn_cast<dataflow::RecordStorageLocation>(Loc);
+  if (!RecordLoc)
+    return;
+
+  // Get or create the has_value synthetic field
+  Value *HasVal = Env.getValue(RecordLoc->getSyntheticField("has_value"));
+  BoolValue *BoolVal = dyn_cast_or_null<BoolValue>(HasVal);
+
+  if (!BoolVal) {
+    // Create has_value if not existing
+    BoolVal = &Env.makeAtomicBoolValue();
+    Env.setValue(RecordLoc->getSyntheticField("has_value"), *BoolVal);
+  }
+
+  // Set the operator bool result to the has_value property
+  // operator bool returns true iff the smart pointer has a value (is non-null)
+  Env.setValue(*MCE, *BoolVal);
+}
+
 // Build the transfer match switch
 auto buildTransferMatchSwitch() {
   using namespace ast_matchers;
@@ -456,6 +517,11 @@ auto buildTransferMatchSwitch() {
                 hasRHS(hasType(pointerType())))
       ));
 
+  // Matcher for smart pointer operator bool (used in conditions like if (sp))
+  auto SmartPtrBoolMatcher = cxxMemberCallExpr(
+      callee(cxxMethodDecl(hasName("operator bool"))),
+      on(expr(hasType(isSmartPointerType()))));
+
   return dataflow::CFGMatchSwitchBuilder<LatticeTransferState>()
       .CaseOfCFGStmt<DeclStmt>(declStmt(), transferDeclStmt)
       .CaseOfCFGStmt<BinaryOperator>(binaryOperator(), transferBinaryOperator)
@@ -464,6 +530,8 @@ auto buildTransferMatchSwitch() {
       .CaseOfCFGStmt<ImplicitCastExpr>(PointerToBoolMatcher, transferPointerToBoolean)
       // Handle pointer-null equality comparisons
       .CaseOfCFGStmt<BinaryOperator>(PointerNullEqMatcher, transferPointerNullComparison)
+      // Handle smart pointer operator bool
+      .CaseOfCFGStmt<CXXMemberCallExpr>(SmartPtrBoolMatcher, transferSmartPointerBool)
       .Build();
 }
 
@@ -489,6 +557,7 @@ public:
   static dataflow::NoopLattice initialElement() { return {}; }
 
   void transfer(const CFGElement &Elt, dataflow::NoopLattice &L, Environment &Env) {
+    initPointerParams(Env);
     LatticeTransferState State(L, Env);
     TransferMatchSwitch(Elt, getASTContext(), State);
   }
@@ -499,6 +568,7 @@ public:
   // IMPORTANT: Stmt is the condition expression, not the terminator statement!
   void transferBranch(bool Branch, const Stmt *S, dataflow::NoopLattice &,
                       Environment &Env) {
+    initPointerParams(Env);
     // S is already the condition expression (e.g., !pInfo, pInfo == nullptr, etc.)
     const Expr *Cond = dyn_cast<Expr>(S);
     if (!Cond)
@@ -577,10 +647,75 @@ public:
         }
       }
     }
+
+    // Case 4: Smart pointer operator bool (if (sp))
+    // sp.operator bool() returns true iff sp has_value (is non-null)
+    if (const auto *MCE = dyn_cast<CXXMemberCallExpr>(Cond)) {
+      if (const CXXMethodDecl *MD = MCE->getMethodDecl()) {
+        if (MD->getNameAsString() == "operator bool" &&
+            isSmartPointerClass(MD->getParent())) {
+          const Expr *ObjectArg = MCE->getImplicitObjectArgument();
+          if (!ObjectArg)
+            return;
+          ObjectArg = ObjectArg->IgnoreParenImpCasts();
+          StorageLocation *Loc = Env.getStorageLocation(*ObjectArg);
+          if (auto *RecordLoc = dyn_cast_or_null<dataflow::RecordStorageLocation>(Loc)) {
+            Value *HasVal = Env.getValue(RecordLoc->getSyntheticField("has_value"));
+            if (auto *BoolVal = dyn_cast_or_null<BoolValue>(HasVal)) {
+              // operator bool returns has_value (true if smart pointer holds value)
+              // if (sp) with Branch=true: sp has value, assume HasVal
+              // if (sp) with Branch=false: sp has no value, assume !HasVal
+              if (Branch) {
+                Env.assume(BoolVal->formula());
+              } else {
+                Env.assume(A.makeNot(BoolVal->formula()));
+              }
+            }
+          }
+        }
+      }
+    }
   }
 
 private:
+  bool ParamsInitialized = false;
   dataflow::CFGMatchSwitch<LatticeTransferState> TransferMatchSwitch;
+
+  // Initialize nullness for pointer/smart pointer parameters
+  // This must be called before any transfer or transferBranch
+  void initPointerParams(Environment &Env) {
+    if (ParamsInitialized)
+      return;
+    ParamsInitialized = true;
+
+    const FunctionDecl *FD = Env.getCurrentFunc();
+    if (!FD)
+      return;
+
+    for (const ParmVarDecl *Param : FD->parameters()) {
+      // Raw pointer parameters
+      if (Param->getType()->isPointerType()) {
+        StorageLocation *Loc = Env.getStorageLocation(*Param);
+        if (Loc) {
+          Value *Val = Env.getValue(*Loc);
+          if (auto *PtrVal = dyn_cast_or_null<PointerValue>(Val)) {
+            // Initialize nullness property with an unconstrained atomic bool
+            getOrCreateNullness(*PtrVal, Env);
+          }
+        }
+      }
+      // Smart pointer parameters
+      if (isSmartPointer(Param->getType())) {
+        StorageLocation *Loc = Env.getStorageLocation(*Param);
+        if (auto *RecordLoc = dyn_cast_or_null<dataflow::RecordStorageLocation>(Loc)) {
+          // Initialize has_value synthetic field if not already set
+          if (!Env.getValue(RecordLoc->getSyntheticField("has_value"))) {
+            Env.setValue(RecordLoc->getSyntheticField("has_value"), Env.makeAtomicBoolValue());
+          }
+        }
+      }
+    }
+  }
 };
 
 // Diagnoser for potential null pointer dereferences
@@ -661,7 +796,9 @@ private:
                 if (auto *RecordLoc = cast_or_null<dataflow::RecordStorageLocation>(Loc)) {
                   Value *HasVal = Env.getValue(RecordLoc->getSyntheticField("has_value"));
                   if (auto *BoolVal = dyn_cast_or_null<BoolValue>(HasVal)) {
-                    if (Env.proves(Env.arena().makeNot(BoolVal->formula())))
+                    // Check if we can prove the smart pointer has a value
+                    // (has_value is true means the smart pointer holds a non-null pointer)
+                    if (Env.proves(BoolVal->formula()))
                       return llvm::SmallVector<SourceLocation>();
                   }
                 }
@@ -683,7 +820,8 @@ private:
                 if (auto *RecordLoc = cast_or_null<dataflow::RecordStorageLocation>(Loc)) {
                   Value *HasVal = Env.getValue(RecordLoc->getSyntheticField("has_value"));
                   if (auto *BoolVal = dyn_cast_or_null<BoolValue>(HasVal)) {
-                    if (Env.proves(Env.arena().makeNot(BoolVal->formula())))
+                    // Check if we can prove the smart pointer has a value
+                    if (Env.proves(BoolVal->formula()))
                       return llvm::SmallVector<SourceLocation>();
                   }
                 }
@@ -705,8 +843,14 @@ void PotentialNullPtrDerefCheck::registerMatchers(MatchFinder *Finder) {
                  unaryOperator(hasOperatorName("*")),
                  cxxOperatorCallExpr(hasAnyOverloadedOperatorName("->", "*")))));
 
+  // Filter out methods inside smart pointer class definitions
+  // We don't want to check the implementation of operator bool, operator-> etc.
+  auto NotSmartPointerMethod = unless(cxxMethodDecl(
+      ofClass(cxxRecordDecl(hasAnyName("unique_ptr", "shared_ptr", "weak_ptr")))));
+
   Finder->addMatcher(
       functionDecl(unless(isExpansionInSystemHeader()),
+                   NotSmartPointerMethod,
                    hasBody(HasPtrDerefDescendant))
           .bind(FuncID),
       this);
