@@ -48,7 +48,7 @@ NOTE: Run these commands from the build directory (`cd build` first)
 
 ```bash
 # Run haha module tests using llvm-lit
-bin/llvm-lit -v ../clang-tools-extra/test/clang-tidy/checkers/haha/
+./build/bin/llvm-lit -v ./clang-tools-extra/test/clang-tidy/checkers/haha/
 
 # Or run all clang-tools tests (includes haha)
 ninja check-clang-tools

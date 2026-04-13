@@ -771,6 +771,18 @@ private:
     return Env.allows(A.makeLiteral(true));
   }
 
+  // Check if the expression is the 'this' pointer
+  // 'this' pointer is never null in non-static member functions (guaranteed by C++ standard)
+  bool isThisPointer(const Expr *E) {
+    E = E->IgnoreParenImpCasts();
+
+    // CXXThisExpr directly represents 'this'
+    if (isa<CXXThisExpr>(E))
+      return true;
+
+    return false;
+  }
+
   // Check if dereference of a pointer is safe
   llvm::SmallVector<SourceLocation> checkDereference(const Expr *PtrExpr,
                                                      const Environment &Env) {
@@ -781,6 +793,10 @@ private:
 
     // Check if current point is reachable (dead code should not report warnings)
     if (!isReachable(Env))
+      return llvm::SmallVector<SourceLocation>();
+
+    // 'this' pointer is never null - skip checking
+    if (isThisPointer(PtrExpr))
       return llvm::SmallVector<SourceLocation>();
 
     // Get the pointer value
